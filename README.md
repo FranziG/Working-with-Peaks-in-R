@@ -12,4 +12,4 @@ For the HTML view go here: https://htmlpreview.github.io/?https://github.com/Fra
 
 2. **PeakOverlapsAndAnnotation.Rmd** covers more advanced operations on GRangeLists, peak annotation to Genomic features and biological functions.
 I also added a discussion on different gene annotation resources, as well as differnet opinions on peak overlaps and reproducible peak definitions.
-For the HTML view go here: 
+For the HTML view go here: https://htmlpreview.github.io/?https://github.com/FranziG/Working-with-Peaks-in-R/blob/master/PeakOverlapsAndAnnotation.html
