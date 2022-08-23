@@ -629,5 +629,14 @@ dotplot(gobp, showCategory=30) +
 Or take control and use `ggplot2` direct on your enrichment results.\
 \
 ```{r, message=FALSE}
+gobp <- as.data.frame(gobp) %>% arrange(desc(Count))
+gobp$Description <- factor(gobp$Description)
 
+  
+ggplot(data = gobp[c(1:10),], aes(x = Description, y=Count, fill=p.adjust))+
+  geom_bar(stat = "identity")+
+  scale_fill_gradient(low="cadetblue1", high="darkblue")+
+  coord_flip()+
+  theme_bw()+
+ theme(axis.text.x = element_text(angle = 90))
 ```
