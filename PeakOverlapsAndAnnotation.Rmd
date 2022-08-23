@@ -1,0 +1,633 @@
+---
+title: "Peak overlaps and annotation"
+author: "Franziska Greulich"
+date: "2022-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Peak Overlaps and annotations
+
+### 1. working with multiple BED files
+
+I am using Cut&Tag data from Kaya-Okur et al. 2019, Nature (https://doi.org/10.1038/s41467-019-09982-5) to demonstrate how to handle multiple peak files, how to convert them into a `GRangesList`. Afterwards, we will compute overlaps, visualize them and annotate our peaks.
+\
+
+```{r, echo=FALSE}
+library("knitr")
+metadata <- data.frame(sample=list.files("./data/KayaOkur2019/",pattern=".narrowPeak",full.names=FALSE), cellType = rep("K562",6), method = rep("Cut&Tag",6), genome = rep("Hg19",6), target = c(rep("IgG",2),rep("H3K27ac",2), rep("H3K27me3",2)), antibody = c(rep("Antibodies-Online ABIN101961",2),rep("Millipore, MABE647",2),rep("Cell Signaling Technology, 9733, Lot 14",2)),GEOaccession = c(rep("GSM3680227",2),rep("GSM3536514",2),rep("GSM3536515",2)))
+kable(metadata, caption = "The data:")
+```
+\
+Let's start with reading and filtering (for unwanted chromosomes) the BED files and convert them into a `GRangeList` object.
+\
+```{r, message=FALSE}
+#load library GenomicRanges
+library("GenomicRanges")
+
+#define bed2GRange fucntion
+bed2GRanges <-function(peaks)
+{
+  myrange <- GRanges(seqnames=peaks[,1],range=IRanges(start=peaks[,2], end=peaks[,3], names=paste(peaks[,1],peaks[,2],peaks[,3],sep="_")), strand="*", score=peaks[,5], pvalue=peaks[,8])
+  return(myrange)
+}
+
+#read input files BED files
+files <- list.files("./data/KayaOkur2019/",pattern=".narrowPeak",full.names=TRUE)
+#generate a list of input peaks
+peaks <- lapply(files, function(x) read.table(x, header = FALSE, stringsAsFactors = FALSE, sep="\t"))
+names(peaks) <- list.files("./data/KayaOkur2019/",pattern=".narrowPeak",full.names=FALSE)
+
+#check if unconventional chromosomes are removed
+for (i in 1:length(peaks)) {
+  print(paste("Chromosomes in",names(peaks)[i],":",unique(peaks[[i]][1]),sep=" "))
+}
+
+#print the number of peaks per sample before removing mitochondrial chromosome
+for (i in 1:length(peaks)) {
+  print(paste(names(peaks)[i],nrow(peaks[[i]]),sep=": "))
+}
+
+#remove mitochondrial DNA
+chrHs <- c("chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19","chr20","chr21","chr22","chrX","chrY")
+
+peaks <- lapply(peaks, FUN = function (x) { x[x$V1%in%chrHs,] } )
+
+#print the number of peaks per sample after removal of the mitochondrial chromosome
+for (i in 1:length(peaks)) {
+  print(paste(names(peaks)[i],nrow(peaks[[i]]),sep=": "))
+}
+
+#convert to GRangesList
+peaks_g <- lapply(peaks,function(x) {bed2GRanges(x)})
+```
+\
+Next, we will look at the overlap with ENCODE's blacklisted regions and remove them. Refer to Amemiya et al. Nature 2019 (https://doi.org/10.1038/s41598-019-45839-z) for more details on how those are defined. BED files can be downloaded from github (https://github.com/Boyle-Lab/Blacklist/tree/master/lists). I use the blacklisted regions for *Hg19* here.
+\
+```{r}
+#import blacklisted regions from bed file (downloaded from https://github.com/Boyle-Lab/Blacklist/tree/master/lists) and convert to GRange object
+blacklist <- read.table("./data/hg19-blacklist.v2.bed",header=FALSE,stringsAsFactors = FALSE,fill=TRUE)
+blacklist_g <- GRanges(seqnames=blacklist[,1],range=IRanges(start=blacklist[,2], end=blacklist[,3], names=paste(blacklist[,1],blacklist[,2],blacklist[,3],sep="_")), strand="*")
+
+#calculate the percent overlap of all peaks with blacklisted regions
+for (i in 1:length(peaks_g)) {
+  print(paste(names(peaks_g)[i],"overlaps ENCODE blacklisted regions to:", round(100*length(subsetByOverlaps(granges(peaks_g[[i]]),blacklist_g,minoverlap = 1,ignore.strand=TRUE))/length(granges(peaks_g[[i]])),2),"%.",sep=" "))
+}
+
+#remove blacklisted regions
+peaks_g <- endoapply(peaks_g,function(x) {subsetByOverlaps(x,blacklist_g,invert = TRUE,minoverlap = 1,ignore.strand=TRUE)})
+
+#print the number of peaks per sample after removal of ENCODE blacklisted regions
+for (i in 1:length(peaks_g)) {
+  print(paste(names(peaks_g)[i],length(granges(peaks_g[[i]])),sep=": "))
+}
+```
+\
+Out of curiosity, I am plotting the peak width for each data set. This might be more relevant when comparing Cut&Tag to conventional ChIPseq or Cut&Run samples.
+\
+```{r, message=FALSE}
+#load library ggplot2
+library("ggplot2")
+
+#extract peak width distribution per sample and store in a new data frame:
+peakwidth <- data.frame()
+
+for (i in 1:length(peaks_g)) {
+  width <- data.frame(width(peaks_g[[i]]))
+  width$sample <- names(peaks_g)[i]
+  peakwidth <- rbind(peakwidth,width)
+}
+colnames(peakwidth) <- c("width","sample")
+peakwidth$sample <- as.factor(peakwidth$sample)
+  
+#plot peak width distribution for all samples as histogram
+ggplot(peakwidth, aes(x=sample, y = width, fill=sample)) +
+ geom_violin() +
+ scale_color_brewer(palette="Dark2")+ 
+ ggtitle("Peak width distribution between samples")+
+ theme_bw()+
+ theme(axis.text.x = element_text(angle = 90))
+ 
+```
+\
+
+### 2. Define a consensus peak set for the respective replicates.\
+\
+But first I like to look at the peak overlap between replicates using a Venn diagram from the `VennDiagram` package for pair-wise comparison.\
+\
+```{r, message=FALSE}
+#load the VennDiagramm package
+library("VennDiagram")
+
+#draw pair-wise proportional Venn diagrams
+samples <- seq(1,length(peaks_g),2)
+i<-1
+for (i in samples) {
+  sample <- sub(".*K562_","", names(peaks_g)[i])
+  sample <- sub("_.*","", sample)
+  print(paste("Venn diagram of",sample,"samples:",sep=" "))
+  venn <- draw.pairwise.venn(area1 = length(peaks_g[[i]]), area2 = length(peaks_g[[i+1]]), cross.area = length(subsetByOverlaps(granges(peaks_g[[i]]), granges(peaks_g[[i+1]]), minoverlap = 10,ignore.strand=TRUE)), category = c("rep1","rep2"), euler.d = TRUE, scaled = TRUE, fill = c("grey24","grey72"))
+  grid.draw(venn)
+  grid.newpage()
+}
+```
+\
+Now, we compute the consensus peak set for each antibody. We also save a BED file of the consensus set for motif enrichment or further analysis.\
+**Note**: In case you work with data from transcription factors setting the peak width of 100 bp around the peak summit will improve motif analysis.\ 
+\
+```{r, message=FALSE}
+#Consensus type 1: e.g. for motifs
+i<-1
+for (i in samples) {
+  sample <- sub(".*K562_","", names(peaks_g)[i])
+  sample <- sub("_.*","", sample)
+  overlap <- intersect(peaks_g[[i]], peaks_g[[i+1]],ignore.strand=TRUE)
+  if (length(overlap)>0){
+    overlap <- overlap
+  }
+  else{overlap <- GRanges()}
+  assign(sample,overlap)
+  write.table(as.data.frame(overlap)[,c(1:3)],paste("./results/consensusPeaks/K562",sample,"consensusPeaksType1.bed",sep="_"),sep="\t",row.names = FALSE,col.names = FALSE)
+  i <- i+2
+}
+consensus1 <- GRangesList(IgG,K27ac,K27me3)
+names(consensus1) <- c("IgG","H3K27ac","H3K27me3")
+
+#Show the number of consensus peaks
+for (i in 1:length(consensus1)) {
+  print(paste(names(consensus1)[i],length(granges(consensus1[[i]])),sep=": "))
+}
+
+#library("SparseSummarizedExperiment")
+
+#Consensus type 2: e.g. for quantification
+i<-1
+for (i in samples) {
+  sample <- sub(".*K562_","", names(peaks_g)[i])
+  sample <- sub("_.*","", sample)
+  overlap <- reduce(append(subsetByOverlaps(peaks_g[[i]], peaks_g[[i+1]],ignore.strand=TRUE,minoverlap=10),subsetByOverlaps(peaks_g[[i+1]], peaks_g[[i]],ignore.strand=TRUE,minoverlap=10)))
+  if (length(overlap)>0){
+    overlap <- overlap
+  }
+  else{overlap <- GRanges()}
+  assign(sample,overlap)
+  write.table(as.data.frame(overlap)[,c(1:3)],paste("./results/consensusPeaks/K562",sample,"consensusPeaksType2.bed",sep="_"),sep="\t",row.names = FALSE,col.names = FALSE)
+  i <- i+2
+}
+consensus2 <- GRangesList(IgG,K27ac,K27me3)
+names(consensus2) <- c("IgG","H3K27ac","H3K27me3")
+
+#Show the number of consensus peaks
+for (i in 1:length(consensus2)) {
+  print(paste(names(consensus2)[i],length(granges(consensus2[[i]])),sep=": "))
+}
+```
+\
+
+#### Irreproducible Discovery Rate (IDR)\
+\
+The aim of IDR is to define reproducibly-called regions by quantitatively defining peak regions that are no longer reproducible among replicates (irreproducible). The p-value from peak calling is used as quality criterion (obtained as score in the _peaks.narrowPeak files) to rank peaks and classifies the signal into reproducible and irreproducible using a copula mixture model (see Li et al. arXiv 2011 (https://arxiv.org/abs/1110.4705) for more details).\
+As peaks are evaluated on the basis of scores, only peaks called in both replicates are considered in IDR analysis. Therefor, IDR analysis is performed on low stringent peak calls (e.g. MACS peak calls with P<1e-5, FDR=0.1 or unfiltered).\
+The `idr` package for R needs to be downloaded from CRAN (https://cran.r-project.org/web/packages/idr/index.html) and installed from source using the `install.package()` function.
+\
+```{r, message=FALSE}
+library("idr")
+#look at consensus peaks
+samples <- seq(1,length(peaks_g),2)
+i<-1
+for (i in samples) {
+  sample <- sub(".*K562_","", names(peaks_g)[i])
+  sample <- sub("_.*","", sample)
+  fo <- as.data.frame(findOverlaps(peaks_g[[i]], peaks_g[[i+1]],ignore.strand=TRUE,minoverlap=10))
+  fo <- fo[!duplicated(fo$queryHits) & !duplicated(fo$subjectHits),]
+  overlap <- as.data.frame(peaks_g[[i]][fo[,1]])
+  overlap <- cbind(overlap,peaks_g[[i]]$pvalue[fo[,1]], peaks_g[[i+1]]$pvalue[fo[,2]])
+  res <- est.IDR(overlap[,c(8:9)], mu=3, sigma=1, rho=.9, p=.5)
+  overlap <- cbind(overlap,idr=res$idr) #local idr
+  colnames(overlap) <- c("seqnames","start","end","width","strand","score","pvalue","score_rep1","score_rep2","idr")
+  print(paste("Signal reproducibility among",sample,"replicates:",sep=" "))
+  ggplot(overlap, aes(score_rep1,score_rep2,col=idr)) + geom_point()
+  if (nrow(overlap[overlap$idr<0.05 &overlap$idr!=0 ,])>0){
+    idr <- bed2GRanges(overlap[overlap$idr<0.05 &overlap$idr!=0 ,c(1:3,5,6,4,8,7)])
+  }
+  else{idr <- GRanges()}
+  assign(sample,idr)
+  write.table(as.data.frame(idr)[,c(1:3)],paste("./results/consensusPeaks/K562",sample,"IDR005.bed",sep="_"),sep="\t",row.names = FALSE,col.names = FALSE)
+  i <- i+2
+}
+idr_peaks<- GRangesList(IgG,K27ac,K27me3)
+names(idr_peaks) <- c("IgG","H3K27ac","H3K27me3")
+
+#Show the number of consensus peaks
+for (i in 1:length(idr_peaks)) {
+  print(paste(names(idr_peaks)[i],length(granges(idr_peaks[[i]])),sep=": "))
+}
+```
+\
+The main drawback of IDR analysis is its limitation towards pair-wise comparison. In cases of more than two replicates, commonly unions of pair-wise reproducible peaks are used to define the consensus peak set.
+Defining peaks based on consensus peak sets (e.g. overlaps or IDR) can be unreliable especially if one replicate is of lower quality. One approach is to increase the number of replicates and define a) a high confidence peak set by filtering for peak regions only recovered in all replicates (good and bad), b) a likely consensus peak set as union of pair-wise reproducible peaks or c) defining a possible peak space by looking at the union of peaks from all replicates. The choice of consensus peak set will depend on the downstream analysis and the purpose of the experiment.\
+A second drawback of peak overlaps is the definition of peak boundaries. Peak boundaries/width depend on the resolution of the assay used as well as on the quality of the data. Boundaries reported from peak callers like MACS are fuzzy.\
+Again, we can use the consensus peak type 1 approach to define the peak boundaries very stringently by only including regions recovered in all replicates. Another elegant approach is ChIP-R and was described by Newell et al. in Genomics 2021 (https://doi.
+org/10.1016/j.ygeno.2021.04.026). ChIP-R classifies canonical fragments from k replicates on there recovery in i€k replicates based on coordinates. Afterwards each of the canonical fragments is assigned a rank based on their respective signal (from the peak caller, can be pile-up or p-value) per replicate. Each rank tuple is evaluated by the rank product test and peak boundaries are defined by merging fragments passing a user defined significance threshold. However, this tool is not yet implemented in R.\
+\
+#### Look at more then two sample overlaps\
+\
+a.) Three sample Venn diagram\
+\
+Pair-wise Venn diagrams are ideal to represent peak overlaps in a proportional way. So called Euler diagrams can also visualize more then 2 peak sets by fitting a model that approximates the best proportional representation. The more peak sets the less accurate will a 2-dimensional representation with regards to proportionality of areas be. Therefor, I do not recommend using Venn diagrams with more then 3 data sets.\
+We are using the `eulerr` package (Micallef et al. PLOS ONE 2014, https://doi.org/10.1371/journal.pone.0101717.). Refer to https://cran.r-project.org/web/packages/eulerr/vignettes/introduction.html for the documentation.
+\
+```{r, message=FALSE}
+#load the eulerr package
+library("eulerr")
+
+#estimate set sizes from the consensus type 1 set
+setIgg <- length(consensus1[[1]])
+setK27ac <- length(consensus1[[2]])
+setK27me3 <- length(consensus1[[3]])
+setIgGK27ac <- length(findOverlaps(consensus1[[1]], consensus1[[2]], ignore.strand = TRUE, minoverlap = 10))
+setIgGK27me3 <- length(findOverlaps(consensus1[[1]], consensus1[[3]], ignore.strand = TRUE, minoverlap = 10))
+setK27acK27me3 <- length(findOverlaps(consensus1[[2]], consensus1[[3]], ignore.strand = TRUE, minoverlap = 10))
+all <- length(findOverlaps(GenomicRanges::intersect(consensus1[[1]], consensus1[[2]]),GenomicRanges::intersect(consensus1[[1]], consensus1[[3]])))
+#fit the representation model using the euler function
+fit <- euler(c("IgG" = setIgg, "K27ac" = setK27ac, "K27me3" = setK27me3, "IgG&K27ac" = setIgGK27ac, "IgG&K27me3" = setIgGK27me3, "K27ac&K27me3" = setK27acK27me3, "IgG&K27ac&K27me3" = all))
+#You can look at the goodness of the fit using the error_plot() function
+error_plot(fit)
+#plot the actual Venn Diagram
+plot(fit, quantities=TRUE, fill = c("grey24","dodgerblue4","firebrick4"),labels = list(font=4), alpha=.5)
+```
+\
+The 3 antibodies used for Cut&Tag occupy mostly non-overlapping genomic regions, with IgG (negative control) having the fewest consensus peaks.\
+\
+b.) UpsetR plots for more complex comparisons.\
+\
+For more complex comparisons, we are using the `UpsetR` package (Conway, Lex and Gehlenborg Bioinformatics 2017; https://doi.org/10.1093/bioinformatics/btx364). Find an extended documentation here: https://jokergoo.github.io/ComplexHeatmap-reference/book/upset-plot.html.\
+We will compare our 3 data sets at this point but come back to `UpsetR` plots later when looking at overlaps with genomic features.
+The `upset` function from `UpSetR` uses an interaction matrix as input in which 0 represents no peak overlap and 1 a peak overlap in a pair-wise comparison.
+\
+```{r, message=FALSE}
+#load the UpsetR package
+library("UpSetR")
+
+#first generate an interaction matrix
+#generate a Grange object with the universe of all peaks
+universe <- append(consensus1[[1]],consensus1[[2]])
+universe <- append(universe, consensus1[[3]])
+names(universe) <- paste(seqnames(universe),start(universe),end(universe),sep="_")
+#sanity check
+length(universe)==length(consensus1[[1]])+length(consensus1[[2]])+length(consensus1[[3]])
+
+#compute the interaction matrix
+matrix <- data.frame(universe)
+matrix$ID <- paste(matrix$seqnames,matrix$start,matrix$end,sep="_")
+matrix$igg <- ifelse(matrix$ID%in%names(subsetByOverlaps(universe,consensus1[[1]],ignore.strand=TRUE,minoverlap=10)),1,0)
+matrix$k27ac <- ifelse(matrix$ID%in%names(subsetByOverlaps(universe,consensus1[[2]],ignore.strand=TRUE,minoverlap=10)),1,0)
+matrix$k27me3 <- ifelse(matrix$ID%in%names(subsetByOverlaps(universe,consensus1[[3]],ignore.strand=TRUE,minoverlap=10)),1,0)
+
+#plot interactions
+upset(matrix) #by default sets are ordered by size
+```
+\
+By default, sets are ordered by size. You can change several parameters like ordering sets by degree of interaction instead of frequency using the `order.by` argument. If you have many sets,you can limit the number sets with the `sets` arguments or the number of intersects to show with `nintersects`. The top n sets or intersects will be shown depending on your ordering parameters. The set bar color can be modified using `sets.bar.color` and the main bar color with `main.bar.color`. This will also affect the color of the set size text. Point sizes can be adjusted using `point.size`, line thickness with `line.size` and axis labels added  using `mainbar.y.label` and `sets.x.label`. The different text layers of the plot can be modified with the `text.scale` argument that takes a vector with `c(intersection size title, intersection size tick labels, set size title, set size tick labels, set names, numbers above bars)`.\
+\
+
+```{r}
+upset(matrix, order.by = "degree", sets=c("k27ac", "igg"), sets.bar.color=c("grey72","dodgerblue4"),point.size =2, line.size=2, text.scale = c(1.3, 1.3, 1, 1, 2, 2))
+```
+\
+You can also group interactions by sets using `group.by`. You can set the cutoff for displayed interactions per set using the `cutoff` argument. If you want to display empty intersects set `, empty.intersections = "on"`.\
+\
+```{r}
+upset(matrix, order.by = "freq", nintersects=20, group.by="sets", cutoff=3, point.size =2, line.size=2,text.scale = c(1.3, 1.3, 1, 1, 2, 2), empty.intersections = "on")
+
+```
+\
+Just looking at the number of overlapping genes ignores the size of the peak sets and may therefor be biased. Hence, we normalize the peak overlap by the peak union size to generate an index reflecting the proportional peak set overlap  (Jaccard index). As the consensus peak sets of our example data has very few overlapping peaks, we use the replicates to compute a matrix of Jaccard indices. Fur this purpose, we generate a function called `jaccard` that computes the jaccard index for two peak sets.\
+\
+```{r, message=FALSE}
+#define a function computing the Jaccard index
+jaccard <- function(set1, set2){
+  intersect <- GenomicRanges::intersect(set1, set2)
+  union <- append(GenomicRanges::intersect(set1, set2), subsetByOverlaps(set1, set2,invert=TRUE,ignore.strand=TRUE, minoverlap=10))
+  union <- append(union,subsetByOverlaps(set2, set1,invert=TRUE,ignore.strand=TRUE, minoverlap=10))
+  jaccard <- length(intersect)/length(union)
+  return(jaccard)
+}
+
+#compute the Jaccard indices for all samples in peaks_g and store as matrix jaccarM
+jaccardM <- endoapply(peaks_g ,function(x){endoapply(peaks_g, function(y){jaccard(x,y)})})
+jaccardM <- matrix(unlist(do.call("cbind",jaccardM)),ncol=length(peaks_g))
+colnames(jaccardM) <- c(sub("_.*","",sub(".*K562_","",names(peaks_g)[seq(names(peaks_g))])))
+rownames(jaccardM) <- c(sub("_.*","",sub(".*K562_","",names(peaks_g)[seq(names(peaks_g))])))
+
+#plot jaccard index as heatmap
+#load packaes required for plotting
+library("gplots")
+library("RColorBrewer")
+#define color scale for heatmap
+col <- colorRampPalette(brewer.pal(10, "Greens"))(256)
+#heatmap of jaccard indices
+heatmap.2(jaccardM, 
+          scale = "none", 
+          col = col, 
+          trace = "none", 
+          density.info = "none", 
+          xlab = "peak set",
+          ylab ="peak set",
+          cexRow=1,
+          cexCol=1,
+          main="Jaccard index")
+
+```
+\
+You see a high overlap between the H3K27ac replicates and H3K27me3 to a lesser extend (indicated by the color saturation), but no overlap between H3K27ac, H3K27me3 and IgG as previously also observed in the Venn diagram.\
+\
+
+### 3. Annotate peak positions to the closest gene.\
+\
+For simplicity and due to our limited understanding of gene regulation, peaks are usually associated to the overlapping or closest gene in the linear genome. In case of expression data being available, you could limit the search space by filtering for expressed genes within a given tissue/cell type. More advanced algorithms using different data sources are GREAT (http://great.stanford.edu/great/public/html/), BETA (http://cistrome.org/BETA/) or multiple peak-to-gene and gene-to-peak associations like FindIT2 (https://bioconductor.org/packages/devel/bioc/vignettes/FindIT2/inst/doc/FindIT2.html).\
+Here we will use the `annotatePeak` function from the `ChIPpeakAnno` package to annotate our peaks to the closest transcriptional start site (TSS). For more details on the `ChIPpeakAnno` package refer to the vignette https://bioconductor.org/packages/devel/bioc/vignettes/ChIPseeker/inst/doc/ChIPseeker.html.\
+\
+#### A) We need to define an annotation object.\
+\
+Annotation data for each genome can be retrieved within R using the Bioconductor package `AnnotationHub`. Find useful information in the vignette (https://bioconductor.org/packages/release/bioc/html/AnnotationHub.html). `AnnotationHub` is a Web resource of genomic files. This resource is constantly changing. Therefor, we will grab a snap shot of annotation hub, that is locally stored and can be used to maintain reproducibility.\
+\
+
+```{r, message=FALSE}
+#laod libraries AnnotationHub and ChIPseeker
+library("AnnotationHub")
+library("ChIPpeakAnno")
+library("GenomicFeatures")
+
+#create an AnnotationHub instance
+ah <- AnnotationHub()
+
+#find the indexes to access the data
+#ah[1]
+
+#first we select the species of interest (e.g. Homo sapiens)
+subset(ah, species == "Homo sapiens")
+
+#You can use the query() function to look for specific resources
+#query(ah, "hg19")
+#or the browser
+#display(ah)
+
+#after looking for gene information on Homo sapiens genome build hg19/GRCh37, we identified the following options
+#a) ENSEMBL GRCh37 release 75: AH10684 (date: 2014-04-27)
+#b) GENCODE GRCh37: AH75128 (date: 2019-10-08)
+#c) UCSC Ref-Seq genes for hg19: AH5040 (date: 2013-03-26)
+#d) UCSC known genes for hg19: AH5036 (date: 2013-3-26)
+#We will use the most recent one from Gencode
+txdb1 <- as.data.frame(ah[["AH75128"]])
+#filter for unique genes
+txdb1 <- txdb1[txdb1$type=="transcript",]
+#remvoe version info on geneIDs
+txdb1$gene_id <- sub("\\..*", "", txdb1$gene_id)
+txdb1 <- txdb1[!duplicated(txdb1$gene_id),]
+annoData <- GRanges(seqnames=txdb1[,1],range=IRanges(start=txdb1[,2], end=txdb1[,3], names=txdb1[,11]), strand=txdb1[,5])
+
+
+for (i in 1:length(consensus1)) {
+  anno <- annotatePeakInBatch(consensus1[[i]], AnnotationData=annoData, output="shortestDistance", featureType = "TSS",PeakLocForDistance = "middle",select = "first")
+  assign(names(consensus1[i]),anno)
+  write.table(as.data.frame(anno),paste("./results/consensusPeaks/K562",sample,"consensusPeaksType1_annotated.txt",sep="_"),sep="\t",row.names = FALSE,col.names = TRUE)
+}
+annoPeaks <- GRangesList("IgG" = IgG,"H3K27ac" = H3K27ac,"H3K27me3" = H3K27me3)
+
+```
+\
+Alternatives to AnnotationHub are build-in annotation databases in R provided by UCSC (!Ref-Seq gene annotation) or ENSEMBL. Alternatively, you can use your own GFF3/GTF files as gene annotation. Finally, we make use of the `UpSetR` package to see that if the annotations differ dependent on the gene annotation source.\
+\
+
+```{r, message=FALSE}
+library("TxDb.Hsapiens.UCSC.hg19.knownGene")
+library("EnsDb.Hsapiens.v75")
+library("tidyr")
+#load UCSC genes
+annoData2 <- genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+#annotated using build-in UCSC known genes
+for (i in 1:length(consensus1)) {
+  anno <- annotatePeakInBatch(consensus1[[i]], AnnotationData=annoData2, output="shortestDistance", featureType = "TSS",PeakLocForDistance = "middle",select = "first")
+  #convert UCSC gene IDs into ENSEMBL
+  anno <- addGeneIDs(annotatedPeak=anno, orgAnn="org.Hs.eg.db", feature_id_type="entrez_id",IDs2Add="ensembl")
+  assign(names(consensus1[i]),anno)
+}
+annoPeaks_UCSC <- GRangesList("IgG" = IgG,"H3K27ac" = H3K27ac,"H3K27me3" = H3K27me3)
+
+#load ENSEMBL transcripts
+annoData3 <- toGRanges(EnsDb.Hsapiens.v75, feature="gene")
+
+#annotated using build in ENSEMBL genes
+for (i in 1:length(consensus1)) {
+  anno <- annotatePeakInBatch(consensus1[[i]], AnnotationData=annoData3, output="shortestDistance", featureType = "TSS",PeakLocForDistance = "middle",select = "first")
+  assign(names(consensus1[i]),anno)
+}
+annoPeaks_ensembl <- GRangesList("IgG" = IgG,"H3K27ac" = H3K27ac,"H3K27me3" = H3K27me3)
+
+#load own GTF file
+gtf <- read.table("./data/gencode.v19.annotation.gtf",header=FALSE,sep="\t",stringsAsFactors = FALSE)
+colnames(gtf) <- c("chr","source","type","start","end","score","strand","phase","info")
+#filter for transcripts
+gtf <- gtf[gtf$type=="transcript",]
+
+#retrieve the meta information stored in info
+gtf$gene_id<-gsub(x = gtf$info,pattern = ".*gene_id ",replacement = "")
+gtf$gene_id<-gsub(x = gtf$gene_id,pattern = "\\;.*",replacement = "")
+gtf$transcript_id<-gsub(x = gtf$info,pattern = ".*transcript_id ",replacement = "")
+gtf$transcript_id<-gsub(x = gtf$transcript_id,pattern = "\\;.*",replacement = "")
+gtf$gene_name<-gsub(x = gtf$info,pattern = ".*gene_name ",replacement = "")
+gtf$gene_name<-gsub(x = gtf$gene_name,pattern = "\\;.*",replacement = "")
+gtf$gene_name<-ifelse(grepl(x=gtf$gene_name,pattern ="transcript_id"),"NA",gtf$gene_name)
+
+#remvoe version info on geneIDs
+gtf$gene_id <- sub("\\..*", "", gtf$gene_id)
+gtf <- gtf[!duplicated(gtf$gene_id),]
+annoData4 <- GRanges(seqnames=gtf[,1],range=IRanges(start=gtf[,4], end=gtf[,5], names=gtf[,10]), strand=gtf[,7])
+#annotate
+for (i in 1:length(consensus1)) {
+  anno <- annotatePeakInBatch(consensus1[[i]], AnnotationData=annoData4, output="shortestDistance", featureType = "TSS",PeakLocForDistance = "middle",select = "first")
+  assign(names(consensus1[i]),anno)
+}
+annoPeaks_gtf <- GRangesList("IgG" = IgG,"H3K27ac" = H3K27ac,"H3K27me3" = H3K27me3)
+
+#compare associated genes in H3K27ac data for all 3 annotation objects
+ucsc1 <- sub(";.*", "",as.data.frame(annoPeaks_UCSC[[2]])$ensembl)
+ucsc2 <- sub(".*;", "",as.data.frame(annoPeaks_UCSC[[2]])$ensembl)
+ucsc <- unique(c(ucsc1,ucsc2))
+
+features <- unique(c(as.data.frame(annoPeaks[[2]])$feature,ucsc,as.data.frame(annoPeaks_ensembl[[2]])$feature,as.data.frame(annoPeaks_gtf[[2]])$feature))
+features <- as.data.frame(features)
+colnames(features) <- "features"
+
+features$anno <- ifelse(features$features%in%as.data.frame(annoPeaks[[2]])$feature,1,0)
+features$ucsc <- ifelse(features$features%in%ucsc,1,0)
+features$ensembl <- ifelse(features$features%in%as.data.frame(annoPeaks_ensembl[[2]])$feature,1,0)
+features$gtf <- ifelse(features$features%in%as.data.frame(annoPeaks_gtf[[2]])$feature,1,0)
+
+upset(features,nintersects=20,order.by = "freq")
+
+```
+\
+Once the peaks are annotated, the distribution of the distance to the nearest feature such as the transcription start sites (TSS) can be plotted. The sample code here plots the distribution of the aggregated peak scores and the number of peaks around the TSS of the H3K27ac data. We define a score parameter that aggregates the number of peaks at close to the TSS.\
+\
+```{r}
+k27ac_anno <- annoPeaks[[2]]
+k27ac_anno$score <- 1
+binOverFeature(annoPeaks[[2]], k27ac_anno, annotationData=annoData,radius=5000, nbins=10, FUN=c(sum, length), ylab=c("score", "count"),     main=c("Distribution of aggregated peak scores around TSS", "Distribution of aggregated peak numbers around TSS"))
+```
+\
+We can also plot the distribution of peaks overlapping genomic features.\
+\
+```{r, message=FALSE}
+#We need a txdb object resembling the annotation we used
+txdb1 <- makeTxDbFromGRanges(ah[["AH75128"]])
+genomicDistribution<-assignChromosomeRegion(annoPeaks[[2]], nucleotideLevel=FALSE,precedence=c("Promoters", "immediateDownstream","fiveUTRs", "threeUTRs","Exons", "Introns"),TxDb=txdb1)
+#plot the percentage of the overlap as barplot
+barplot(genomicDistribution$percentage)
+#plot the jaccard index of the overlap as barplot
+barplot(genomicDistribution$jaccard)
+```
+\
+A second popular annotation package in R is `ChIPseeker`. We can use the `anntotatePeak` function, which only works with Txdb objects. Therefore, we have to convert all different annotation sources into Txdb objects first.\
+\
+```{r, message=FALSE, warnings=FALSE}
+library("ChIPseeker")
+#from annotation hub
+txdb1 <- makeTxDbFromGRanges(ah[["AH75128"]])
+#We can use lapply instead of for loops to annotate all 3 GRanges objects in our list
+annoPeaks_CS <- lapply(consensus1, annotatePeak, TxDb=txdb1,tssRegion=c(-1000, 500),level = "gene",annoDb = "org.Hs.eg.db", verbose=FALSE)
+
+#annotated using build-in UCSC known genes
+txdb2 <- TxDb.Hsapiens.UCSC.hg19.knownGene
+annoPeaks_CS_UCSC <- lapply(consensus1, annotatePeak, TxDb=txdb2,tssRegion=c(-1000, 500),level = "gene",annoDb = "org.Hs.eg.db", verbose=FALSE)
+
+#load ENSEMBL transcripts
+seqlevelsStyle(EnsDb.Hsapiens.v75) <- "UCSC"
+annoPeaks_CS_ensembl <- lapply(consensus1, annotatePeak, TxDb=EnsDb.Hsapiens.v75,tssRegion=c(-1000, 500),level = "gene",annoDb = "org.Hs.eg.db", verbose=FALSE)
+
+#annotate using GTF file
+#convert GTF into Txdb object using makeTxDbFromGFF from the GenomicFeatures package
+txdb4 <- makeTxDbFromGFF("./data/gencode.v19.annotation.gtf",format = "gtf",dataSource = "GENCODE",organism = "Homo sapiens")
+annoPeaks_CS_gtf <- lapply(consensus1, annotatePeak, TxDb=txdb4,tssRegion=c(-1000, 500),level = "gene",annoDb = "org.Hs.eg.db", verbose=FALSE)
+
+#compare associated genes in H3K27ac data for all 3 annotation objects
+#note that gtf gene ids will still have the gene version info
+features <- unique(c(sub("\\..*", "",as.data.frame(annoPeaks_CS[[2]])$geneId),as.data.frame(annoPeaks_CS_UCSC[[2]])$ENSEMBL,as.data.frame(annoPeaks_CS_ensembl[[2]])$geneId,sub("\\..*", "", as.data.frame(annoPeaks_CS_gtf[[2]])$geneId)))
+features <- as.data.frame(features[!is.na(features)])
+colnames(features) <- "features"
+
+features$anno <- ifelse(features$features%in%sub("\\..*", "",as.data.frame(annoPeaks_CS[[2]])$geneId),1,0)
+features$ucsc <- ifelse(features$features%in%as.data.frame(annoPeaks_CS_UCSC[[2]])$ENSEMBL,1,0)
+features$ensembl <- ifelse(features$features%in%as.data.frame(annoPeaks_CS_ensembl[[2]])$geneId,1,0)
+features$gtf <- ifelse(features$features%in%sub("\\..*", "", as.data.frame(annoPeaks_CS_gtf[[2]])$geneId),1,0)
+
+upset(features,nintersects=20,order.by = "freq")
+```
+\
+The `ChIPseeker` package also includes some build-in functions to look at the genomic distribution. See the code below for some examples using the H3K27ac data. Find more information on the `ChIPseeker` in the vignette (https://bioconductor.org/packages/devel/bioc/vignettes/ChIPseeker/inst/doc/ChIPseeker.html#peak-annotation).
+**Note**: Feel free to modify the code in order to look at H3K27me3.\
+\
+```{r}
+#genomic feature distribution as bar plot
+plotAnnoBar(annoPeaks_CS[[2]])
+#genomic feature distribution as upset plot looking at combinations of genomic locations per gene
+upsetplot(annoPeaks_CS[[2]])
+#genomic distance of peaks relative to TSS as bar plot
+plotDistToTSS(annoPeaks_CS[[2]], title=paste("Distribution of",names(annoPeaks_CS)[[2]],"relative to TSS",sep=" "))
+#ChIPseeker can also compare peak sets when provided as list
+#genomic feature distribution as bar plot
+plotAnnoBar(annoPeaks_CS)
+```
+
+\
+Just as side note here. You can retrieve all the annotation information e.g. the peaks overlapping promoters as data frames or `GRange` objects with classical sub-setting. I only show one example here.\
+\
+```{r}
+k27ac <- as.data.frame(annoPeaks_CS[[2]])
+k27ac_prom <- GRanges(k27ac[k27ac$annotation=="Promoter",])
+head(k27ac_prom)
+```
+\
+
+### 4. Functional annotation of genes associated with peaks\
+\
+Another common tasks to characterize peaks or peak subsets is functional annotation according to Gene Ontology or KEGG pathways. The `ChIPseeker` package provides an integrated function, bu we can also use the `clusterProfiler` package from Guangchuang Yu (Yu G eta al. OMICS 2012, (https://doi.org/10.1089/omi.2011.0118)).
+**Note**: Most functional annotation tools require ENTREZIDs as input format.\
+\
+
+#### a.) Reactome pathway enrichment with `ChIPseeker`:\
+\
+```{r, message=FALSE}
+library("ReactomePA")
+
+pathway1 <- enrichPathway(as.data.frame(annoPeaks_CS[[2]])$ENTREZID,organism = "human",pAdjustMethod = "BH",qvalueCutoff = 0.05,readable = TRUE)
+head(pathway1, 2)
+#we can use the seq2gene function to annotate genes in a many-to-many fashion by defining a flanking distance (we use the txdb2 object here to extract ENTREZIDs)
+gene <- seq2gene(GRanges(as.data.frame(annoPeaks_CS[[2]])[,c(1:3,5)],geneId=as.data.frame(annoPeaks_CS[[2]])[,14]), tssRegion = c(-1000, 500), flankDistance = 3000, TxDb=txdb2)
+pathway2 <- enrichPathway(gene)
+head(pathway2, 2)
+```
+\
+
+#### b.) Functional enrichment using `clusterProfiler`.\
+\
+We use the `clusterProfiler` package here to functionally interpret our peak set associated genes using over-representation analysis of KEGG pathways and Gene ontology (GO) for biological processes. \
+**Note**: KEGG pathway enrichment only works with ENTREZ gene ids (=NCBI gene ids (UCSC, Ref-Seq)) and does only support the following organisms: http://www.genome.jp/kegg/catalog/org_list.html.\
+**Note**: Over-representation alalysis is only possible on non-duplicated lists of genes.\
+\
+```{r, message=FALSE}
+library("clusterProfiler")
+
+#generate a list of interesting genes using ENTREZIDs
+k27ac <- unique(as.data.frame(annoPeaks_CS[[2]])$ENTREZID)
+
+#KEGG over-representation analysis
+keggp <- enrichKEGG(gene = k27ac, organism = 'hsa',pAdjustMethod = "BH", qvalueCutoff = 0.05, minGSSize = 3)
+head(keggp)
+#Note: Kegg Pathways do not output the gene names contributing to a pathway, those need to be assigned with the setReadable() function.
+keggp <- setReadable(keggp, 'org.Hs.eg.db', 'ENTREZID')
+head(keggp)
+
+#over-representation analysis for Gene ontology "Biological Process"
+gobp <- enrichGO(gene = k27ac, OrgDb = org.Hs.eg.db,ont = "BP", pAdjustMethod = "BH", qvalueCutoff  = 0.05, readable = TRUE)
+head(gobp)
+#Note GO enrichment can be done by any supported Gene ID, so also with symbols or ENSEMBL IDs. The keytype parameter specifies the import format.
+gobp2 <- enrichGO(gene = sub("\\..*", "",as.data.frame(annoPeaks_CS[[2]])$geneId),keyType = "ENSEMBL", OrgDb = org.Hs.eg.db,ont = "BP", pAdjustMethod = "BH", qvalueCutoff  = 0.05, readable = TRUE)
+head(gobp2)
+```
+\
+The results of the functional enrichment analysis can be visulaized using build-in plotting fucntions of the `clusterProfiler` package or visualization package `ggplot2`. See https://r-graphics.org/index.html to dive into the possibilities of `ggplot` for data visualization in R.\
+\
+```{r}
+#1. Bar plots
+barplot(gobp, showCategory=20) + ggtitle("Bar plot of the gene ontology over-representation")
+barplot(keggp, showCategory=20) + ggtitle("Bar plot of the KEGG pathway over-representation")
+#2. Dot plots
+dotplot(gobp, showCategory=30) + ggtitle("Dotplot of the gene ontology over-representation results")
+dotplot(keggp, showCategory=30) + ggtitle("Dotplot of the KEGG over-representation results")
+#3. Upset plots showing shared categories by genes
+upsetplot(gobp)
+upsetplot(keggp)
+```
+\
+Plots can be modified using ggplot2, the visualization package in R. Find extensive documentation in the book by Hadley Wickham (https://ggplot2-book.org/).\
+\
+```{r, message=FALSE}
+library("ggplot2")
+
+dotplot(gobp, showCategory=30) +
+  ggtitle("Dotplot of the gene ontology over-representation results") +
+  scale_colour_gradient(low="green", high="darkgreen")
+
+```
+\
+Or take control and use `ggplot2` direct on your enrichment results.\
+\
+```{r, message=FALSE}
+
+```

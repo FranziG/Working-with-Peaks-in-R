@@ -1,0 +1,205 @@
+---
+title: "Import peaks into R"
+author: "Franziska Greulich"
+date: "2022-08-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Import MACS peaks into R
+
+We will work with peaks called by MACS. I provided an example peak set in the ./data/MACS/ sub directory which I will use to illustrate the different import options. However, later you gonna use you own data in the exercise.\
+\
+**1. import BED files**
+\
+
+```{r}
+#read input data in BED format: Example of a _summit.bed MACS output.
+peaks_bed <- read.table("./data/MACS/hMonocytes_4h1uMTA_aGR_rep1_SRR6497267overSRR6497265_SE_hg38_FDR005_summits.bed", header = FALSE, sep = '\t', stringsAsFactors = FALSE)
+
+#show the first 10 lines
+head(peaks_bed, 10)
+
+```
+\
+The function `read.table` reads an input file and transformed it into a data.frame, the basic data structure in R. Lines starting with # are ignored by default and the option `header=FALSE` indicates that the first line does not contain column names.\
+\
+You can assign column names to make the table more readable.
+\
+```{r}
+#Assign column names to peaks_bed data frame.
+colnames(peaks_bed) <- c("chr","start","end","name","score")
+
+#Show the top rows
+head(peaks_bed)
+```
+\
+
+**2. import narrowPeak files**
+\
+Similar to BED files, narrowPeak files are standard tab-delimited and can be read using the `read.table` function of R. They do not contain a header, so we have to define the column names manually.
+\
+```{r}
+#read input data in narrowPeak format: Example of a _peaks.narrowPeak MACS output.
+peaks_narrow <- read.table("./data/MACS/hMonocytes_4h1uMTA_aGR_rep1_SRR6497267overSRR6497265_SE_hg38_FDR005_peaks.narrowPeak", header = FALSE, sep = '\t', stringsAsFactors = FALSE)
+
+#show the first 10 lines
+head(peaks_narrow, 10)
+
+#Assign column names.
+colnames(peaks_narrow) <- c("chr","start","end","name","score","strand","fold-change","pvalue_log10","qvalue_log10","summit")
+
+#Show the top rows
+head(peaks_narrow)
+
+```
+\
+**3. import MACS .xls files**
+\
+In contrast to BED and NarrowPeak files, MACS _peaks.xls files contain meta data within the first rows as well as column headers. By default the `read.table` function ignores commented rows. In order to include them, set the `comment.char` argument to "". MACS _peaks.xls files already contain a header row, therefor set the header argument to `header=TRUE`. 
+\
+```{r}
+#read input data in XLS format: Example of a _peaks.xls MACS output.
+peaks_macs <- read.table("./data/MACS/hMonocytes_4h1uMTA_aGR_rep1_SRR6497267overSRR6497265_SE_hg38_FDR005_peaks.xls", header = TRUE, sep = '\t', stringsAsFactors=FALSE)
+
+#show the top rows
+head(peaks_macs)
+
+#read input data in XLS format without ignoring commented rows.
+peaks_macs_test <- read.table("./data/MACS/hMonocytes_4h1uMTA_aGR_rep1_SRR6497267overSRR6497265_SE_hg38_FDR005_peaks.xls", header = TRUE, sep = '\t', stringsAsFactors = FALSE, comment.char = "")
+
+#show the top rows
+head(peaks_macs_test)
+
+#We could overcome the issue of meta data lines by skipping the first lines using the skip argument (in case those are not commented).
+peaks_macs_test2 <- read.table("./data/MACS/hMonocytes_4h1uMTA_aGR_rep1_SRR6497267overSRR6497265_SE_hg38_FDR005_peaks.xls", header = TRUE, sep = '\t', stringsAsFactors=FALSE, comment.char = "", skip=27)
+
+#show the top rows
+head(peaks_macs_test2)
+
+```
+\
+
+## Rename chromosomes and remove unconventional chromosomes\
+\
+Chromosomes mapped using the ENSEMBL genome build (as in this example data) will be annotated by numbers only, whereas chromosomes in the NCBI/UCSC genome builds a annotated as "chr" + number. Furthermore, genome builds may contain additional chromosomes like alternative sequences or mitochondria, which might be irrelevant when studying nuclear processes.
+\
+```{r}
+#look at chromosome annotation (using the narrowPeak file)
+print("List of chromosome names according to original annotation:")
+unique(peaks_narrow$chr)
+
+#Paste the "chr" string in front of the  chromosome number to allow for compliance with downstream analysis using NCBI chromosome annotations (Note: This is only required if ENSMBL genome builds from past 2016 were used.)
+peaks_narrow$chr<-paste("chr",peaks_narrow$chr,sep="")
+
+print("List of chromosome names after pasting \"chr\":")
+unique(peaks_narrow$chr)
+
+#filter chromosomes
+#define "compliant" chromosomes
+chrHs <- c("chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10","chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19","chr20","chr21","chr22","chrX","chrY")
+#filter
+peaks_narrow <- peaks_narrow[peaks_narrow$chr%in%chrHs,]
+
+print("Remaining chromosomes after filtering:")
+unique(peaks_narrow$chr)
+
+```
+\
+
+## Convert peaks into GRanges\
+\
+A `GRange` object (from the `GenomicRanges` package) is an useful data type to store genomic locations and annotations. In order to make things easier, we define a function `bed2GRanges` that converts or imported tab-delimited data into a `GRange` object using the `GRanges` function from the `GenomicRanges` package.
+The minimal composition of a `GRange` object consists of `seqnames` holding the chromosome name and an `IRanges` object holding start and end coordinates as well as the strand information of the DNA sequence. Additional data can be provided as metadata columns.
+\
+```{r, message = FALSE}
+#load the GenomicRanges package
+library("GenomicRanges")
+```
+
+```{r}
+#define a function to convert BED formatted data into GRanges (the strand can be set to * for unstranded data such as ChIP)
+#Note: If the peaks do not have specified names, you can generate unique names pasting chr, start and end
+bed2GRanges <-function(peaks)
+{
+  myrange <- GRanges(seqnames = peaks[,1],range = IRanges(start = peaks[,2], end = peaks[,3], names = peaks[,4]), strand = "*")
+  return(myrange)
+}
+
+#convert the filtered narrow peak file into a GRange object.
+peaks_narrow_g <- bed2GRanges(peaks_narrow)
+
+#Have a look at the GRange structure.
+head(peaks_narrow_g)
+```
+\
+We can add more meta data.\
+\
+```{r}
+# add metadata.
+peaks_narrow_g <- GRanges(seqnames = peaks_narrow$chr,range = IRanges(start = peaks_narrow$start, end = peaks_narrow$end, names = peaks_narrow$name), strand="*", FC = peaks_narrow$`fold-change`, qvalue = peaks_narrow$qvalue_log10)
+
+#add metadata on predefined metadata columns (in GRanges function) downstream (see ?GRanges for more info)
+score(peaks_narrow_g) <- peaks_narrow$score
+
+#or overwrite existing data
+names(peaks_narrow_g) <- paste(peaks_narrow$chr,peaks_narrow$start,peaks_narrow$end,sep="_")
+
+#Show the GRange object including metadata.
+head(peaks_narrow_g)
+```
+\
+Access information stored in the `GRanges` object using accessor functions:
+
+```{r}
+#Metadata
+mcols(peaks_narrow_g)
+
+#Fold-change
+mcols(peaks_narrow_g)$FC
+
+#genomic location only
+granges(peaks_narrow_g)
+```
+\
+Let'S extract some useful information from the GRange object for exploratory analysis.\
+\
+a.) How many peaks are contained?
+```{r}
+length(peaks_narrow_g)
+```
+\
+b.) Distribution of peak sizes:
+```{r}
+hist(width(peaks_narrow_g), main = "Peak size distribution", xlab = "Peak width")
+```
+\
+c.) Distribution of p-values:
+```{r}
+peaks_narrow_g <- GRanges(seqnames = peaks_narrow$chr,range = IRanges(start = peaks_narrow$start, end = peaks_narrow$end, names = peaks_narrow$name), strand = "*", FC = peaks_narrow$`fold-change`, qvalue = peaks_narrow$qvalue_log10, pvalue =  peaks_narrow$pvalue_log10)
+hist(mcols(peaks_narrow_g)$pvalue, main = "P-value distribution of peaks", xlab = "P-value")
+```
+\
+One big advantage of working with `GRanges` are functions of the `GenomicRanges` package interrogating the sequence position such as overlaps or differences, but also peak width, gaps etc... .\ 
+\
+We will make use of the `subsetByOverlaps` function to determine the overlap of our peaks with ENCODE blacklisted regions and to remove those from our data. Refer to Amemiya et al. Nature 2019 (https://doi.org/10.1038/s41598-019-45839-z) for more details on how those are defined. BED files can be downloaded from github (https://github.com/Boyle-Lab/Blacklist/tree/master/lists). I have added the blacklisted regions for *Hg38* to the ./data/ sub folder already. \
+\
+```{r}
+#import blacklisted regions from bed file (downloaded from https://github.com/Boyle-Lab/Blacklist/tree/master/lists) and convert to GRange object
+blacklist <- read.table("./data/hg38-blacklist.v2.bed", header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+blacklist_g <- bed2GRanges(blacklist)
+
+#calculate the percent overlap of all peaks with blacklisted regions
+print(paste(round(100*length(subsetByOverlaps(peaks_narrow_g, blacklist_g, minoverlap = 1, ignore.strand = TRUE))/length(peaks_narrow_g), 2), "% overlap ENCODE-blacklisted regions.", sep=" "))
+
+#remove blacklisted regions
+peaks_narrow_g <- subsetByOverlaps(peaks_narrow_g,blacklist_g,invert = TRUE, minoverlap = 1, ignore.strand = TRUE)
+
+#print the number of peaks per sample after removal of ENCODE blacklisted regions
+print(paste(length(peaks_narrow_g), "peaks remain after removal of ENCODE's blacklisted regions.", sep =" "))
+```
+\
+This was the first part. More complex operations follow using multiple peak files in `PeakOverlapsAndAnnotations.Rmd`.
